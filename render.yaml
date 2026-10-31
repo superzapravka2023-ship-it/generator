@@ -1,0 +1,31 @@
+# Blueprint для Render. Деплой: GitHub → Render → New → Blueprint.
+# Генерация крутится фоном на сервере, поэтому нужен ВСЕГДА включённый инстанс (plan starter).
+services:
+  - type: web
+    name: pin-generator
+    runtime: python
+    plan: starter            # $7/мес, всегда онлайн (free засыпает и убьёт фоновую задачу)
+    buildCommand: pip install -r requirements.txt
+    # 1 воркер (фоновые задачи держатся в памяти процесса) + потоки; без таймаута запроса
+    startCommand: gunicorn -w 1 -k gthread --threads 16 -t 0 --bind 0.0.0.0:$PORT app:app
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: anthropic/claude-haiku-5-5
+      - key: IMAGE_MODEL
+        value: google/gemini-2.5-flash-image
+      - key: ADMIN_PASSWORD        # ОБЯЗАТЕЛЬНО задай — пароль на вход в приложение
+        sync: false
+      - key: WORKERS
+        value: "6"
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: R2_PUBLIC_BASE
+        sync: false
