@@ -241,23 +241,37 @@ def image_params(model, quality):
 
 
 def generate_image(prompt, model, quality="low"):
+    """С авто-повтором при временных сбоях (429 rate limit / 5xx / обрыв сети)."""
     payload = {"model": model, "prompt": prompt}
     payload.update(image_params(model, quality))
-    r = HTTP.post(f"{OR_BASE}/images", headers=HEADERS, json=payload, timeout=240)
-    if not r.ok:
-        raise RuntimeError(f"OpenRouter image {r.status_code}: {r.text[:300]}")
-    data = r.json().get("data", [])
-    if not data:
-        raise RuntimeError("Пустой ответ image API: " + r.text[:200])
-    item = data[0]
-    if item.get("b64_json"):
-        return base64.b64decode(item["b64_json"])
-    url = item.get("url") or (item.get("image_url") or {}).get("url")
-    if url:
-        ir = HTTP.get(url, timeout=120)
-        ir.raise_for_status()
-        return ir.content
-    raise RuntimeError("Не нашёл картинку в ответе: " + r.text[:200])
+    err = None
+    for attempt in range(3):
+        try:
+            r = HTTP.post(f"{OR_BASE}/images", headers=HEADERS, json=payload, timeout=240)
+        except requests.RequestException as e:
+            err = RuntimeError("сеть: " + str(e)[:120])
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        if r.status_code in (429, 500, 502, 503, 504):
+            err = RuntimeError(f"OpenRouter image {r.status_code} (повтор)")
+            time.sleep(2 * (attempt + 1))  # подождать и повторить (лимиты)
+            continue
+        if not r.ok:
+            # не временная ошибка (напр. 403 гео) — повторять бессмысленно
+            raise RuntimeError(f"OpenRouter image {r.status_code}: {r.text[:300]}")
+        data = r.json().get("data", [])
+        if not data:
+            raise RuntimeError("Пустой ответ image API: " + r.text[:200])
+        item = data[0]
+        if item.get("b64_json"):
+            return base64.b64decode(item["b64_json"])
+        url = item.get("url") or (item.get("image_url") or {}).get("url")
+        if url:
+            ir = HTTP.get(url, timeout=120)
+            ir.raise_for_status()
+            return ir.content
+        raise RuntimeError("Не нашёл картинку в ответе: " + r.text[:200])
+    raise err or RuntimeError("image failed")
 
 
 def make_one(p, idx, P):
@@ -322,7 +336,7 @@ def run_job(job_id, P):
             # Автосохранение CSV на R2 после каждой пачки
             try:
                 csv_text = build_csv_text(job["rows"])
-                upload_to_r2(f"{P['folder']}/_pins.csv", csv_text.encode("utf-8"), "text/csv; charset=utf-8")
+                upload_to_r2(f"{P['folder']}/_pins.csv", csv_text.encode("utf-8"), "text/csv")
                 job["csv_url"] = f"{R2_PUBLIC_BASE}/{P['folder']}/_pins.csv"
             except Exception:
                 pass

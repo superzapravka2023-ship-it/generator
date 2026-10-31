@@ -98,7 +98,7 @@
     <div class="bar">
       <button class="btn" id="go">Запустить генерацию</button>
       <button class="btn ghost" id="dl" disabled>Скачать CSV</button>
-      <button class="btn ghost" id="forget" class="hide">Новая сессия</button>
+      <button class="btn ghost" id="forget">Новая сессия</button>
       <span class="count-pill" id="pill"></span>
     </div>
 
@@ -150,9 +150,12 @@ function enterApp(){
 }
 
 function addRow(row){
+  const items=$('#items');
   const el=document.createElement('div'); el.className='item';
-  el.innerHTML='<img loading="lazy" src="'+row["Media URL"]+'"><div class="t"><b>'+esc(row["Title"])+'</b>'+esc((row["Description"]||'').slice(0,90))+'…</div>';
-  $('#items').appendChild(el);
+  el.innerHTML='<img loading="lazy" src="'+(row["Media URL"]||'')+'"><div class="t"><b>'+esc(row["Title"])+'</b>'+esc((row["Description"]||'').slice(0,90))+'…</div>';
+  items.appendChild(el);
+  // показываем только последние 60 превью, чтобы не грузить сотни тяжёлых картинок разом
+  while(items.children.length>60) items.removeChild(items.firstChild);
 }
 function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML;}
 
@@ -164,13 +167,16 @@ function startPolling(){
       .then(r=>{ if(r.status===404){ stopJob('Задача не найдена (сервер мог перезапуститься). Готовый CSV — на R2.'); return null;} return r.json(); })
       .then(d=>{
         if(!d) return;
-        (d.rows||[]).forEach(addRow); rendered += (d.rows||[]).length;
+        if(d.csv_url) csvUrl=d.csv_url;
+        // кнопка CSV активна, как только есть хоть одна строка (или ссылка на R2)
+        if((d.rows_total||0)>0 || d.csv_url){ $('#dl').disabled=false; }
+        try{ (d.rows||[]).forEach(addRow); }catch(e){}
+        rendered += (d.rows||[]).length;
         const pct = d.total? Math.round(d.done/d.total*100):0;
         $('#prog > i').style.width=pct+'%';
         $('#pill').textContent=d.done+' / '+d.total+(d.errors?('  · ошибок '+d.errors):'');
         $('#logline').textContent=d.stage||'';
-        if(d.csv_url){ csvUrl=d.csv_url; $('#dl').disabled=false; }
-        if(d.status==='done' || d.status==='error'){ stopJob(); $('#go').disabled=false; }
+        if(d.status==='done' || d.status==='error'){ stopJob(); $('#go').disabled=false; if((d.rows_total||0)>0) $('#dl').disabled=false; }
       }).catch(()=>{});
   };
   tick(); polling=setInterval(tick,2500);
@@ -203,9 +209,17 @@ $('#go').onclick = ()=>{
 };
 
 $('#dl').onclick = ()=>{
-  // качаем автосохранённый CSV с R2, либо собранный сервером
+  // качаем автосохранённый CSV с R2, либо собранный сервером из памяти задачи
   const url = csvUrl || ('/api/download?job_id='+encodeURIComponent(JOB)+(PW?('&key='+encodeURIComponent(PW)):''));
   window.open(url,'_blank');
+};
+
+$('#forget').onclick = ()=>{
+  try{ localStorage.removeItem('zpw_job'); }catch(e){}
+  JOB=''; rendered=0; csvUrl=''; stopJob('');
+  $('#items').innerHTML=''; $('#prog > i').style.width='0'; $('#prog').style.display='none';
+  $('#pill').textContent=''; $('#logline').textContent='Новая сессия — заполни поля и запусти.';
+  $('#go').disabled=false; $('#dl').disabled=true;
 };
 </script>
 </body>
