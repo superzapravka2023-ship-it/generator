@@ -40,7 +40,21 @@ R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
 R2_BUCKET = os.getenv("R2_BUCKET", "").strip()
-R2_PUBLIC_BASE = os.getenv("R2_PUBLIC_BASE", "").strip().rstrip("/")
+def _clean_public_base(v):
+    """Защита от мусора в значении (например, прилипшей строки терминала):
+    берём первый токен и обрезаем всё после .r2.dev (или после хоста)."""
+    v = (v or "").strip()
+    if not v:
+        return ""
+    v = v.split()[0]                      # отрезать всё после пробела
+    m = re.search(r"^(https?://[^\s/]+\.r2\.dev)", v)   # случай r2.dev
+    if m:
+        return m.group(1).rstrip("/")
+    m = re.search(r"^(https?://[^\s/]+)", v)            # общий случай: схема+хост
+    return (m.group(1) if m else v).rstrip("/")
+
+
+R2_PUBLIC_BASE = _clean_public_base(os.getenv("R2_PUBLIC_BASE", ""))
 
 OR_BASE = "https://openrouter.ai/api/v1"
 HEADERS = {
@@ -54,7 +68,7 @@ USE_PROXY = os.getenv("USE_SYSTEM_PROXY", "1") != "0"
 HTTP = requests.Session()
 HTTP.trust_env = USE_PROXY
 
-WORKERS = int(os.getenv("WORKERS", "6"))
+WORKERS = int(os.getenv("WORKERS", "4"))  # 4 — стабильнее по лимитам; можно поднять в .env
 PLAN_BATCH = 10
 
 IMAGE_PRESETS = [
@@ -68,6 +82,15 @@ CSV_COLS = ["Title", "Media URL", "Pinterest board", "Thumbnail",
             "Description", "Link", "Publish date", "Keywords", "Status"]
 
 app = Flask(__name__)
+
+
+@app.after_request
+def no_cache(resp):
+    # HTML и API не кэшируем — чтобы обновления интерфейса всегда применялись
+    # (иначе браузер/Render отдаёт старую страницу, и правки «не срабатывают»).
+    if resp.mimetype in ("text/html", "application/json"):
+        resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
 
 
 # ---------------- R2 (S3) ----------------
