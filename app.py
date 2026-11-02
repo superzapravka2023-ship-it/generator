@@ -74,7 +74,7 @@ HTTP.mount("https://", _adapter)
 HTTP.mount("http://", _adapter)
 
 WORKERS = int(os.getenv("WORKERS", "12"))  # конвейер + Gemini хорошо тянут; для gpt-image снизь до 2-3
-PLAN_BATCH = 15
+PLAN_BATCH = 12
 
 IMAGE_PRESETS = [
     {"id": "google/gemini-2.5-flash-image", "label": "Gemini Flash (реалистично, текст+руки) ~$39/1000"},
@@ -241,7 +241,8 @@ Return a JSON array of exactly {n} objects. Each object:
 }}
 
 RULES:
-- Every pin must be UNIQUE — different subject, title, description AND typography style. No repeats or near-duplicates.
+- Return exactly {n} DIFFERENT pins. Every pin must be UNIQUE — different subject, title, description AND typography style. No repeats or near-duplicates.
+- NEVER repeat or pad the list with duplicate items to reach the count. If you run low on ideas, INVENT new distinct subjects that fit the niche.
 - The "style" must differ from pin to pin — never reuse the same font/layout style back to back.
 - Titles <= 100 chars, descriptions <= 400 chars.
 - Language: English (US).
@@ -351,33 +352,38 @@ def run_job(job_id, P):
     used = []
 
     def planner():
-        base, guard = 0, 0
-        while base < count and guard < count + 40 and not job.get("cancel"):
+        seen = set()        # нормализованные title/subject — защита от повторов
+        produced = 0        # сколько УНИКАЛЬНЫХ пинов уже поставлено в очередь
+        guard = 0
+        while produced < count and guard < count * 3 + 60 and not job.get("cancel"):
             guard += 1
-            n = min(PLAN_BATCH, count - base)
+            n = min(PLAN_BATCH, count - produced)
             try:
-                batch = plan_batch(P["keywords"], P["brief"], n, used[-80:])
+                batch = plan_batch(P["keywords"], P["brief"], n, used[-120:])
             except Exception:
                 try:
-                    batch = plan_batch(P["keywords"], P["brief"], n, used[-80:])
+                    batch = plan_batch(P["keywords"], P["brief"], n, used[-120:])
                 except Exception:
                     continue
             if not batch:
                 continue
-            batch = batch[:n]
-            for k, p in enumerate(batch):
-                if job.get("cancel"):
+            for p in batch:
+                if job.get("cancel") or produced >= count:
                     break
-                idx = start + base + k
-                board = boards[(base + k) % len(boards)]
+                key = (p.get("title", "").strip().lower() or p.get("subject", "").strip().lower())
+                if not key or key in seen:
+                    continue          # дубликат — пропускаем, в очередь не кладём
+                seen.add(key)
+                idx = start + produced
+                board = boards[produced % len(boards)]
                 while not job.get("cancel"):
                     try:
                         q.put((p, idx, board), timeout=0.5)
                         break
                     except queue.Full:
                         continue
-            base += len(batch)
-            used.extend([p.get("title", "") for p in batch])
+                produced += 1
+                used.append(p.get("title", ""))
         plan_done.set()
 
     def worker():
