@@ -18,10 +18,10 @@ import csv as csvmod
 import json
 import time
 import uuid
+import queue
 import base64
 import threading
 import pathlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from flask import Flask, request, Response, send_file, jsonify
@@ -68,7 +68,7 @@ USE_PROXY = os.getenv("USE_SYSTEM_PROXY", "1") != "0"
 HTTP = requests.Session()
 HTTP.trust_env = USE_PROXY
 
-WORKERS = int(os.getenv("WORKERS", "4"))  # 4 — стабильнее по лимитам; можно поднять в .env
+WORKERS = int(os.getenv("WORKERS", "8"))  # конвейер + Gemini хорошо тянут; для gpt-image снизь до 2-3
 PLAN_BATCH = 10
 
 IMAGE_PRESETS = [
@@ -277,7 +277,7 @@ def generate_image(prompt, model, quality="low"):
             continue
         if r.status_code in (429, 500, 502, 503, 504):
             err = RuntimeError(f"OpenRouter image {r.status_code} (повтор)")
-            time.sleep(2 * (attempt + 1))  # подождать и повторить (лимиты)
+            time.sleep(1 + attempt)  # короткий бэкофф, чтобы не тормозить весь поток
             continue
         if not r.ok:
             # не временная ошибка (напр. 403 гео) — повторять бессмысленно
@@ -313,59 +313,110 @@ JOBS = {}
 JOBS_LOCK = threading.Lock()
 
 
-def run_job(job_id, P):
-    job = JOBS[job_id]
-    count = P["count"]
-    boards = P["boards"]
-    start = P["start"]
-    done, used, guard = 0, [], 0
+def _save_csv(job, folder):
+    with JOBS_LOCK:
+        rows = list(job["rows"])
     try:
-        while done < count and guard < count + 40:
+        upload_to_r2(f"{folder}/_pins.csv", build_csv_text(rows).encode("utf-8"), "text/csv")
+        job["csv_url"] = f"{R2_PUBLIC_BASE}/{folder}/_pins.csv"
+    except Exception:
+        pass
+
+
+def run_job(job_id, P):
+    """Конвейер: отдельный поток ПЛАНИРУЕТ пины и кладёт их в очередь,
+    а пул воркеров ОДНОВРЕМЕННО генерит картинки. Планирование и генерация идут
+    параллельно — воркеры не простаивают, скорость заметно выше."""
+    job = JOBS[job_id]
+    count, boards, start = P["count"], P["boards"], P["start"]
+    folder = P["folder"]
+    q = queue.Queue(maxsize=max(4, WORKERS * 3))
+    plan_done = threading.Event()
+    used = []
+
+    def planner():
+        base, guard = 0, 0
+        while base < count and guard < count + 40 and not job.get("cancel"):
             guard += 1
-            base = done
             n = min(PLAN_BATCH, count - base)
-            job["stage"] = f"Планирую пины {base + 1}–{base + n} из {count}…"
             try:
                 batch = plan_batch(P["keywords"], P["brief"], n, used[-80:])
             except Exception:
                 try:
                     batch = plan_batch(P["keywords"], P["brief"], n, used[-80:])
-                except Exception as e:
-                    job["stage"] = f"Пропускаю пачку (план): {str(e)[:120]}"
+                except Exception:
                     continue
             if not batch:
                 continue
             batch = batch[:n]
-            used.extend([p.get("title", "") for p in batch])
-            job["stage"] = f"Генерирую картинки… ({done}/{count})"
-
-            with ThreadPoolExecutor(max_workers=min(WORKERS, len(batch))) as ex:
-                futmap = {}
-                for k, p in enumerate(batch):
-                    idx = start + base + k
-                    board = boards[(base + k) % len(boards)]
-                    futmap[ex.submit(make_one, p, idx, P)] = (p, board)
-                for fut in as_completed(futmap):
-                    p, board = futmap[fut]
-                    done += 1
+            for k, p in enumerate(batch):
+                if job.get("cancel"):
+                    break
+                idx = start + base + k
+                board = boards[(base + k) % len(boards)]
+                while not job.get("cancel"):
                     try:
-                        row = fut.result()
-                        row["Pinterest board"] = board
-                        job["rows"].append(row)
-                    except Exception as e:
-                        job["errors"].append({"title": p.get("title", ""), "msg": str(e)[:200]})
-                    job["done"] = done
+                        q.put((p, idx, board), timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+            base += len(batch)
+            used.extend([p.get("title", "") for p in batch])
+        plan_done.set()
 
-            # Автосохранение CSV на R2 после каждой пачки
+    def worker():
+        while not job.get("cancel"):
             try:
-                csv_text = build_csv_text(job["rows"])
-                upload_to_r2(f"{P['folder']}/_pins.csv", csv_text.encode("utf-8"), "text/csv")
-                job["csv_url"] = f"{R2_PUBLIC_BASE}/{P['folder']}/_pins.csv"
-            except Exception:
-                pass
+                p, idx, board = q.get(timeout=0.5)
+            except queue.Empty:
+                if plan_done.is_set():
+                    break
+                continue
+            try:
+                row = make_one(p, idx, P)
+                row["Pinterest board"] = board
+                with JOBS_LOCK:
+                    job["rows"].append(row)
+            except Exception as e:
+                with JOBS_LOCK:
+                    job["errors"].append({"title": p.get("title", ""), "msg": str(e)[:200]})
+            with JOBS_LOCK:
+                job["done"] += 1
 
-        job["stage"] = f"Готово. Успешно: {len(job['rows'])} из {count}. Ошибок: {len(job['errors'])}."
-        job["status"] = "done"
+    try:
+        pth = threading.Thread(target=planner, daemon=True)
+        pth.start()
+        workers = [threading.Thread(target=worker, daemon=True) for _ in range(max(1, WORKERS))]
+        for w in workers:
+            w.start()
+
+        # Монитор: периодически сохраняем CSV на R2 и обновляем статус.
+        last_saved = -1
+        while True:
+            alive = any(w.is_alive() for w in workers)
+            with JOBS_LOCK:
+                n_rows = len(job["rows"])
+                n_err = len(job["errors"])
+                done = job["done"]
+            if n_rows and n_rows != last_saved:
+                _save_csv(job, folder)
+                last_saved = n_rows
+            job["stage"] = (f"Генерация… {done}/{count}" + (f" · ошибок {n_err}" if n_err else "")
+                            + ("" if plan_done.is_set() else " · планирую…"))
+            if not alive and (plan_done.is_set() or job.get("cancel")):
+                break
+            time.sleep(2)
+
+        for w in workers:
+            w.join(timeout=5)
+        _save_csv(job, folder)  # финальное сохранение
+
+        if job.get("cancel"):
+            job["status"] = "stopped"
+            job["stage"] = f"Остановлено. Готово: {len(job['rows'])}. Ошибок: {len(job['errors'])}."
+        else:
+            job["status"] = "done"
+            job["stage"] = f"Готово. Успешно: {len(job['rows'])} из {count}. Ошибок: {len(job['errors'])}."
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e)
@@ -395,6 +446,7 @@ def config_check():
     }.items() if not v]
     return jsonify({"ok": not missing, "missing": missing,
                     "models": IMAGE_PRESETS, "default_model": IMAGE_PRESETS[0]["id"],
+                    "public_base": R2_PUBLIC_BASE,
                     "auth_required": bool(ADMIN_PASSWORD)})
 
 
@@ -431,7 +483,8 @@ def start():
     with JOBS_LOCK:
         JOBS[job_id] = {"status": "running", "stage": "Запуск…", "done": 0,
                         "total": P["count"], "rows": [], "errors": [],
-                        "csv_url": "", "error": "", "folder": folder, "created": time.time()}
+                        "csv_url": "", "error": "", "folder": folder,
+                        "cancel": False, "created": time.time()}
     threading.Thread(target=run_job, args=(job_id, P), daemon=True).start()
     return jsonify({"job_id": job_id, "total": P["count"], "folder": folder})
 
@@ -452,6 +505,18 @@ def status():
         "rows": job["rows"][after:],   # только новые строки
         "rows_total": len(job["rows"]),
     })
+
+
+@app.post("/api/stop")
+def stop():
+    if not authed(request):
+        return jsonify({"error": "unauthorized"}), 401
+    jid = request.args.get("job_id", "") or (request.get_json(silent=True) or {}).get("job_id", "")
+    job = JOBS.get(jid)
+    if not job:
+        return jsonify({"error": "not found"}), 404
+    job["cancel"] = True
+    return jsonify({"ok": True})
 
 
 @app.get("/api/jobs")

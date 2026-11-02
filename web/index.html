@@ -97,6 +97,7 @@
 
     <div class="bar">
       <button class="btn" id="go">Запустить генерацию</button>
+      <button class="btn ghost" id="stop" style="display:none">Остановить</button>
       <button class="btn ghost" id="dl" disabled>Скачать CSV</button>
       <button class="btn ghost" id="forget">Новая сессия</button>
       <span class="count-pill" id="pill"></span>
@@ -112,6 +113,7 @@
 const $ = s => document.querySelector(s);
 let PW = '';           // пароль
 let JOB = '';          // текущий job_id
+let PUBLIC_BASE = '';  // публичный адрес R2 (для восстановления CSV)
 let rendered = 0;      // сколько строк уже отрисовано
 let csvUrl = '';
 let polling = null;
@@ -124,6 +126,7 @@ fetch('/api/config-check').then(r=>r.json()).then(d=>{
     const w=$('#warn'); w.style.display='block';
     w.textContent='Не заданы ключи: '+d.missing.join(', ')+'. Проверь .env (локально) или переменные окружения сервиса.';
   }
+  PUBLIC_BASE = d.public_base || '';
   const sel=$('#model');
   (d.models||[]).forEach(m=>{const o=document.createElement('option');o.value=m.id;o.textContent=m.label;
     if(m.id===d.default_model)o.selected=true;sel.appendChild(o);});
@@ -160,11 +163,11 @@ function addRow(row){
 function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML;}
 
 function startPolling(){
-  $('#prog').style.display='block'; $('#go').disabled=true;
+  $('#prog').style.display='block'; $('#go').disabled=true; $('#stop').style.display=''; $('#stop').disabled=false;
   if(polling) clearInterval(polling);
   const tick=()=>{
     fetch('/api/status?job_id='+encodeURIComponent(JOB)+'&after='+rendered,{headers:hdr()})
-      .then(r=>{ if(r.status===404){ stopJob('Задача не найдена (сервер мог перезапуститься). Готовый CSV — на R2.'); return null;} return r.json(); })
+      .then(r=>{ if(r.status===404){ onJobLost(); return null;} return r.json(); })
       .then(d=>{
         if(!d) return;
         if(d.csv_url) csvUrl=d.csv_url;
@@ -176,12 +179,20 @@ function startPolling(){
         $('#prog > i').style.width=pct+'%';
         $('#pill').textContent=d.done+' / '+d.total+(d.errors?('  · ошибок '+d.errors):'');
         $('#logline').textContent=d.stage||'';
-        if(d.status==='done' || d.status==='error'){ stopJob(); $('#go').disabled=false; if((d.rows_total||0)>0) $('#dl').disabled=false; }
+        if(d.status==='done' || d.status==='error' || d.status==='stopped'){ stopJob(); $('#go').disabled=false; if((d.rows_total||0)>0) $('#dl').disabled=false; }
       }).catch(()=>{});
   };
   tick(); polling=setInterval(tick,2500);
 }
-function stopJob(msg){ if(polling){clearInterval(polling);polling=null;} if(msg)$('#logline').textContent=msg; }
+function stopJob(msg){ if(polling){clearInterval(polling);polling=null;} $('#stop').style.display='none'; if(msg)$('#logline').textContent=msg; }
+
+// Сервер перезапустился и потерял задачу из памяти — но CSV сохранён на R2, даём скачать.
+function onJobLost(){
+  stopJob('Задача не найдена (сервер мог перезапуститься). Но готовый CSV сохранён на R2 — качай кнопкой ниже.');
+  $('#go').disabled=false;
+  const folder = (localStorage.getItem('zpw_folder')||$('#folder').value.trim()||'');
+  if(PUBLIC_BASE && folder){ csvUrl = PUBLIC_BASE+'/'+folder+'/_pins.csv'; $('#dl').disabled=false; }
+}
 
 $('#go').onclick = ()=>{
   const payload={
@@ -203,7 +214,7 @@ $('#go').onclick = ()=>{
   fetch('/api/start',{method:'POST',headers:hdr(),body:JSON.stringify(payload)})
     .then(r=>r.json()).then(d=>{
       if(d.error){ alert(d.error); return; }
-      JOB=d.job_id; try{localStorage.setItem('zpw_job',JOB);}catch(e){}
+      JOB=d.job_id; try{localStorage.setItem('zpw_job',JOB);localStorage.setItem('zpw_folder',payload.folder);}catch(e){}
       startPolling();
     }).catch(e=>{ $('#logline').textContent='Ошибка запуска: '+e.message; });
 };
@@ -212,6 +223,13 @@ $('#dl').onclick = ()=>{
   // качаем автосохранённый CSV с R2, либо собранный сервером из памяти задачи
   const url = csvUrl || ('/api/download?job_id='+encodeURIComponent(JOB)+(PW?('&key='+encodeURIComponent(PW)):''));
   window.open(url,'_blank');
+};
+
+$('#stop').onclick = ()=>{
+  if(!JOB){ return; }
+  $('#stop').disabled=true; $('#logline').textContent='Останавливаю… (текущая пачка допишется и остановится)';
+  fetch('/api/stop?job_id='+encodeURIComponent(JOB)+(PW?('&key='+encodeURIComponent(PW)):''),{method:'POST',headers:hdr()})
+    .then(()=>{}).catch(()=>{ $('#stop').disabled=false; });
 };
 
 $('#forget').onclick = ()=>{
