@@ -24,6 +24,7 @@ import threading
 import pathlib
 
 import requests
+from requests.adapters import HTTPAdapter
 from flask import Flask, request, Response, send_file, jsonify
 from dotenv import load_dotenv
 
@@ -67,9 +68,13 @@ HEADERS = {
 USE_PROXY = os.getenv("USE_SYSTEM_PROXY", "1") != "0"
 HTTP = requests.Session()
 HTTP.trust_env = USE_PROXY
+# Большой пул соединений — иначе при высокой параллельности запросы ждут свободный коннект (по умолчанию всего 10).
+_adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64, max_retries=0)
+HTTP.mount("https://", _adapter)
+HTTP.mount("http://", _adapter)
 
-WORKERS = int(os.getenv("WORKERS", "8"))  # конвейер + Gemini хорошо тянут; для gpt-image снизь до 2-3
-PLAN_BATCH = 10
+WORKERS = int(os.getenv("WORKERS", "12"))  # конвейер + Gemini хорошо тянут; для gpt-image снизь до 2-3
+PLAN_BATCH = 15
 
 IMAGE_PRESETS = [
     {"id": "google/gemini-2.5-flash-image", "label": "Gemini Flash (реалистично, текст+руки) ~$39/1000"},
@@ -94,16 +99,27 @@ def no_cache(resp):
 
 
 # ---------------- R2 (S3) ----------------
+_S3 = None
+_S3_LOCK = threading.Lock()
+
+
 def r2_client():
-    import boto3
-    from botocore.config import Config
-    endpoint = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-    return boto3.client(
-        "s3", endpoint_url=endpoint,
-        aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-        region_name="auto",
-        config=Config(signature_version="s3v4", proxies=(None if USE_PROXY else {})),
-    )
+    # Один переиспользуемый клиент (boto3 потокобезопасен) — не создаём его на каждую картинку.
+    global _S3
+    if _S3 is None:
+        with _S3_LOCK:
+            if _S3 is None:
+                import boto3
+                from botocore.config import Config
+                endpoint = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+                _S3 = boto3.client(
+                    "s3", endpoint_url=endpoint,
+                    aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+                    region_name="auto",
+                    config=Config(signature_version="s3v4", proxies=(None if USE_PROXY else {}),
+                                  max_pool_connections=64, retries={"max_attempts": 3}),
+                )
+    return _S3
 
 
 def upload_to_r2(key, data, content_type="image/jpeg"):
