@@ -73,7 +73,7 @@ _adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64, max_retries=0)
 HTTP.mount("https://", _adapter)
 HTTP.mount("http://", _adapter)
 
-WORKERS = int(os.getenv("WORKERS", "12"))  # конвейер + Gemini хорошо тянут; для gpt-image снизь до 2-3
+WORKERS = int(os.getenv("WORKERS", "3"))  # мало потоков = мало лимитов 429 (надёжнее). Можно поднять, если не ловишь ошибки
 PLAN_BATCH = 12
 
 IMAGE_PRESETS = [
@@ -285,16 +285,16 @@ def generate_image(prompt, model, quality="low"):
     payload = {"model": model, "prompt": prompt}
     payload.update(image_params(model, quality))
     err = None
-    for attempt in range(3):
+    for attempt in range(6):  # до 6 попыток — чтобы дожать редкие лимиты, а не падать в ошибку
         try:
             r = HTTP.post(f"{OR_BASE}/images", headers=HEADERS, json=payload, timeout=240)
         except requests.RequestException as e:
             err = RuntimeError("сеть: " + str(e)[:120])
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(2 * (attempt + 1))
             continue
         if r.status_code in (429, 500, 502, 503, 504):
             err = RuntimeError(f"OpenRouter image {r.status_code} (повтор)")
-            time.sleep(1 + attempt)  # короткий бэкофф, чтобы не тормозить весь поток
+            time.sleep(min(3 * (attempt + 1), 20))  # нарастающий бэкофф при лимитах 429
             continue
         if not r.ok:
             # не временная ошибка (напр. 403 гео) — повторять бессмысленно

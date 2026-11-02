@@ -18,7 +18,7 @@ services:
       - key: ADMIN_PASSWORD        # ОБЯЗАТЕЛЬНО задай — пароль на вход в приложение
         sync: false
       - key: WORKERS
-        value: "12"
+        value: "3"
       - key: R2_ACCOUNT_ID
         sync: false
       - key: R2_ACCESS_KEY_ID
