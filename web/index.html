@@ -178,7 +178,7 @@ function startPolling(){
         const pct = d.total? Math.round(d.done/d.total*100):0;
         $('#prog > i').style.width=pct+'%';
         $('#pill').textContent=d.done+' / '+d.total+(d.errors?('  · ошибок '+d.errors):'');
-        $('#logline').textContent=d.stage||'';
+        $('#logline').textContent=(d.stage||'') + (d.errors&&d.last_error ? ('  ·  причина ошибок: '+d.last_error.slice(0,160)) : '');
         if(d.status==='done' || d.status==='error' || d.status==='stopped'){ stopJob(); $('#go').disabled=false; if((d.rows_total||0)>0) $('#dl').disabled=false; }
       }).catch(()=>{});
   };

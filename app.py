@@ -79,7 +79,7 @@ PLAN_BATCH = 12
 IMAGE_PRESETS = [
     {"id": "google/gemini-2.5-flash-image", "label": "Gemini Flash (реалистично, текст+руки) ~$39/1000"},
     {"id": "bytedance-seed/seedream-4.5",   "label": "Seedream 4.5 (фотореализм еды) ~$30–50/1000"},
-    {"id": "openai/gpt-image-2",            "label": "GPT Image 2 (дёшево, нужен VPN) ~$6/1000"},
+    {"id": "openai/gpt-image-2",            "label": "GPT Image 2 (~$6/1000, OpenAI может блокировать регион)"},
 ]
 PRESET_IDS = {p["id"] for p in IMAGE_PRESETS}
 
@@ -519,11 +519,12 @@ def status():
     if not job:
         return jsonify({"error": "not found"}), 404
     after = int(request.args.get("after", 0))
+    last_error = job["errors"][-1]["msg"] if job["errors"] else ""
     return jsonify({
         "status": job["status"], "stage": job["stage"],
         "done": job["done"], "total": job["total"],
         "errors": len(job["errors"]), "csv_url": job["csv_url"],
-        "folder": job["folder"],
+        "folder": job["folder"], "last_error": last_error,
         "rows": job["rows"][after:],   # только новые строки
         "rows_total": len(job["rows"]),
     })
