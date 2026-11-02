@@ -74,7 +74,7 @@ HTTP.mount("https://", _adapter)
 HTTP.mount("http://", _adapter)
 
 WORKERS = int(os.getenv("WORKERS", "3"))  # мало потоков = мало лимитов 429 (надёжнее). Можно поднять, если не ловишь ошибки
-PLAN_BATCH = 12
+PLAN_BATCH = 6  # меньше пачка — на каждый пин выдаётся развёрнутый image-промпт (250-400+ слов)
 
 IMAGE_PRESETS = [
     {"id": "google/gemini-2.5-flash-image", "label": "Gemini Flash (реалистично, текст+руки) ~$39/1000"},
@@ -216,58 +216,61 @@ def parse_plan_json(content):
 
 
 def plan_batch(keywords, brief, n, avoid):
-    system = ("You are a senior Pinterest content strategist for the US market. You produce UNIQUE pin "
-              "concepts and their copy for ANY niche. You output ONLY valid JSON. No markdown, no commentary.")
+    """Планировщик: по большому БРИФУ выдаёт на каждый пин ГОТОВЫЙ короткий image-промпт
+    (self-contained) + копирайт. В image-модель уходит ТОЛЬКО image_prompt, а не весь бриф —
+    поэтому лимит длины картинки не превышается."""
+    system = ("You are a senior Pinterest creative director and image-prompt engineer. For each pin you output a "
+              "COMPLETE, self-contained IMAGE GENERATION PROMPT that fully follows the DESIGN BRIEF, plus the pin's "
+              "copy. The image model will receive ONLY your image_prompt (never the brief), so each image_prompt "
+              "must stand alone. You output ONLY valid JSON. No markdown, no commentary.")
     avoid_block = ""
     if avoid:
         avoid_block = "\n\nDO NOT repeat or closely resemble these already-used titles:\n- " + "\n- ".join(avoid)
     kw_line = keywords.strip() if keywords and keywords.strip() else \
-        "(none given — infer suitable, varied unique subjects that fit the design brief)"
-    user = f"""Create {n} COMPLETELY UNIQUE Pinterest pins.
+        "(none given — pick varied unique subjects that fit the design brief)"
+    user = f"""Create {n} COMPLETELY UNIQUE Pinterest pins, following the DESIGN BRIEF exactly.
 
-TOPIC / NICHE KEYWORDS (use these for the VARIETY of subjects):
+TOPIC / NICHE KEYWORDS (use for subject variety):
 {kw_line}
 
-DESIGN BRIEF (the visual style EVERY pin must follow exactly — only the subject and typography change between pins):
+DESIGN BRIEF (obey it fully — it defines niches, products, templates, visual style, on-image text, CTA, rules):
 {brief}{avoid_block}
 
 Return a JSON array of exactly {n} objects. Each object:
 {{
-  "subject": "a short, SPECIFIC and UNIQUE subject for THIS pin (the exact dish / item / topic), clearly different from every other pin and from the avoid list",
-  "style": "a DISTINCT typography + design style for THIS pin — a specific font pairing and overall layout flavor, clearly DIFFERENT from the other pins. Vary widely: 'bold condensed modern sans-serif, minimalist'; 'elegant vintage serif with flowing script accent'; 'playful rounded handwritten'; 'rustic farmhouse slab serif'; 'bright editorial magazine serif'; 'chunky retro display'; 'delicate thin serif, lots of whitespace'; 'bold all-caps poster'. Invent fresh combinations.",
-  "title": "catchy Pinterest title, MAX 100 characters, unique",
-  "description": "engaging Pinterest description, MAX 400 characters, keyword-rich, unique, natural US English",
-  "keywords": "2-4 comma-separated Pinterest search phrases"
+  "title": "Pinterest title, primary keyword FIRST, MAX 100 chars, unique",
+  "image_prompt": "a COMPLETE ready-to-paste image generation prompt, about 250-400 words (go longer, up to ~600 words, ONLY if the chosen template needs a lot of on-image text such as full ingredient lists for every dish, numbered steps, or checklist/tracker rows — never pad with filler). Fully realize the DESIGN BRIEF for THIS unique pin: the chosen template/layout in detail, EVERY exact on-image TEXT string in quotes (title, subtitle, badges, each dish/section label with its detail line, numbers, save-hook, visit-site CTA), photography style/angle/surface/props, the palette and the font trio. It MUST be fully self-contained because the image model receives ONLY this text, never the brief. End it with: all text perfectly spelled, sharp and legible, no website address, no URL, no brand name, no logo, no watermark, no faces, realistic, 2:3, high resolution.",
+  "description": "Pinterest description, primary keyword first, MAX 480 chars, 2 hashtags at the end, unique",
+  "keywords": "2-4 comma-separated Pinterest search phrases",
+  "board": "a keyword-rich Pinterest board name fitting this pin's niche"
 }}
 
 RULES:
-- Return exactly {n} DIFFERENT pins. Every pin must be UNIQUE — different subject, title, description AND typography style. No repeats or near-duplicates.
-- NEVER repeat or pad the list with duplicate items to reach the count. If you run low on ideas, INVENT new distinct subjects that fit the niche.
-- The "style" must differ from pin to pin — never reuse the same font/layout style back to back.
-- Titles <= 100 chars, descriptions <= 400 chars.
+- Return exactly {n} DIFFERENT pins — unique product/topic/template/palette/fonts/title/image.
+- NEVER repeat or pad the list with duplicates. If low on ideas, invent new distinct ones that fit the brief.
+- Each image_prompt must be self-contained and under 900 words.
 - Language: English (US).
 Return ONLY the JSON array."""
-    plans = chat_json(system, user, max_tokens=4000)
+    plans = chat_json(system, user, max_tokens=14000)
     for p in plans:
-        p["subject"] = (p.get("subject", "") or "").strip()
-        p["style"] = (p.get("style", "") or "").strip()
         p["title"] = cap(p.get("title", ""), 100)
-        p["description"] = cap(p.get("description", ""), 400)
+        p["image_prompt"] = (p.get("image_prompt", "") or "").strip()[:16000]
+        p["description"] = cap(p.get("description", ""), 480)
         p["keywords"] = (p.get("keywords", "") or "").strip()
+        p["board"] = (p.get("board", "") or "").strip()
     return plans[:n]
 
 
 def build_image_prompt(brief, p):
-    parts = [brief]
-    subj = (p.get("subject") or "").strip()
-    if subj:
-        parts.append(f"The specific subject of THIS pin: {subj}. "
-                     "Make it completely unique and visually different from the other pins.")
-    style = (p.get("style") or "").strip()
-    if style:
-        parts.append("Typography & design style for THIS pin (the fonts, title treatment and layout "
-                     f"must be clearly DIFFERENT from other pins): {style}.")
-    return "\n\n".join(parts)
+    """В image-модель уходит ТОЛЬКО готовый промпт пина (бриф — лишь для планировщика),
+    иначе длинный бриф превышает лимит длины модели (32000 символов)."""
+    ip = (p.get("image_prompt") or "").strip()
+    if ip:
+        return ip[:30000]
+    # запасной вариант, если планировщик не дал image_prompt — короткий бриф + сюжет
+    subj = (p.get("subject") or p.get("title") or "").strip()
+    fallback = (brief[:20000] + (("\n\nSubject: " + subj) if subj else ""))
+    return fallback[:30000]
 
 
 # ---------------- OpenRouter: картинка ----------------
@@ -396,7 +399,7 @@ def run_job(job_id, P):
                 continue
             try:
                 row = make_one(p, idx, P)
-                row["Pinterest board"] = board
+                row["Pinterest board"] = (p.get("board") or board)  # доска из плана, иначе — из поля UI
                 with JOBS_LOCK:
                     job["rows"].append(row)
             except Exception as e:
